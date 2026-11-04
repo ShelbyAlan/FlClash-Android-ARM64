@@ -1,0 +1,134 @@
+name: Build Android ARM64 tar.gz
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+  release:
+    types: [ published ]
+
+env:
+  FLUTTER_VERSION: "3.35.7"
+  GO_VERSION: "1.23"
+  RUST_VERSION: "stable"
+  ANDROID_NDK_VERSION: "26.1.10909125"
+  ANDROID_PLATFORM_VERSION: "34"
+  ANDROID_BUILD_TOOLS_VERSION: "34.0.0"
+
+jobs:
+  build-android-arm64:
+    name: Build Android ARM64 tar.gz
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 17
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: >
+            ndk;${{ env.ANDROID_NDK_VERSION }}
+            platforms;android-${{ env.ANDROID_PLATFORM_VERSION }}
+            build-tools;${{ env.ANDROID_BUILD_TOOLS_VERSION }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust Android targets
+        run: |
+          rustup target add aarch64-linux-android
+          rustup component add rust-src
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Install Flutter dependencies
+        run: flutter pub get
+
+      - name: Build Android ARM64
+        run: dart setup.dart android --arch arm64
+        env:
+          ANDROID_NDK: ${{ steps.setup-android.outputs.ndk-path }}
+          ANDROID_NDK_HOME: ${{ steps.setup-android.outputs.ndk-path }}
+
+      - name: Debug build outputs
+        run: |
+          echo "=== workspace ==="
+          ls -la
+          echo "=== dist/ ==="
+          ls -laR dist/ || true
+          echo "=== build/ ==="
+          ls -laR build/ || true
+          echo "=== all tar.gz ==="
+          find . -name "*.tar.gz" -not -path "./.dart_tool/*" || true
+          echo "=== all so ==="
+          find . -name "*.so" -not -path "./.dart_tool/*" || true
+
+      - name: Find or create android-arm64.tar.gz
+        id: package
+        run: |
+          set -euo pipefail
+
+          TAR_NAME="android-arm64.tar.gz"
+
+          # 1. 如果 dist/ 里已经有 tar.gz，就直接用
+          EXISTING=$(find dist/ -maxdepth 2 -name "*.tar.gz" -print -quit 2>/dev/null || true)
+
+          if [ -n "$EXISTING" ]; then
+            cp "$EXISTING" "$TAR_NAME"
+            echo "file=$TAR_NAME" >> "$GITHUB_OUTPUT"
+            echo "source=existing" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 2. 如果没有 tar.gz，就把 dist/ 里的 arm64 产物打包
+          mkdir -p pack
+
+          if [ -d dist ]; then
+            cp -a dist/* pack/ 2>/dev/null || true
+          fi
+
+          # 兜底：把可能存在的 arm64 so 也复制进来
+          find . -name "*arm64*" -name "*.so" -not -path "./.dart_tool/*" -exec cp {} pack/ \; || true
+          find . -name "*aarch64*" -name "*.so" -not -path "./.dart_tool/*" -exec cp {} pack/ \; || true
+
+          if [ -z "$(ls -A pack/ 2>/dev/null || true)" ]; then
+            echo "No build outputs found in dist/ or pack/"
+            exit 1
+          fi
+
+          tar czf "$TAR_NAME" -C pack .
+          echo "file=$TAR_NAME" >> "$GITHUB_OUTPUT"
+          echo "source=packed" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlClash-android-arm64
+          path: ${{ steps.package.outputs.file }}
+          retention-days: 30
+
+      - name: Upload to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.package.outputs.file }}
